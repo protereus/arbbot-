@@ -26,6 +26,9 @@ from hummingbot.exceptions import InvalidScriptModule, OracleRateUnavailable
 from hummingbot.strategy.directional_strategy_base import DirectionalStrategyBase
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
+from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
+from hummingbot.data_feed.market_data_provider import MarketDataProvider
+
 
 if TYPE_CHECKING:
     from hummingbot.client.hummingbot_application import HummingbotApplication  # noqa: F401
@@ -267,13 +270,63 @@ class StartCommand(GatewayChainApiManager):
             self.logger().error(str(e), exc_info=True)
 
     def _initialize_strategy(self, strategy_name: str):
-        if self.is_current_strategy_script_strategy():
+        if self.is_current_strategy_script_strategy(): # Checks for .py file in scripts folder
             self.start_script_strategy()
-        else:
-            start_strategy: Callable = get_strategy_starter_file(strategy_name)
-            if strategy_name in settings.STRATEGIES:
-                start_strategy(self)
+        elif hasattr(self.strategy_config_map.hb_config, 'controller_name'): # Check if it's a V2 Controller
+            # Logic to initialize V2 Controller
+            controller_config = self.strategy_config_map.hb_config # This is the actual Pydantic model instance
+
+            known_controller_subfolders = ["generic", "market_making", "directional_trading"]
+            controller_module = None
+            actual_controller_name_from_config = self.strategy_config_map.controller_name # e.g. "arbitrage_controller"
+
+            for subfolder in known_controller_subfolders:
+                try:
+                    module_path_str = f"{settings.CONTROLLERS_MODULE}.{subfolder}.{actual_controller_name_from_config}"
+                    controller_module = importlib.import_module(module_path_str)
+                    break
+                except ImportError:
+                    continue
+
+            if not controller_module:
+                self.notify(f"Could not find controller module for {actual_controller_name_from_config}")
+                raise NotImplementedError
+
+            controller_class = next((member for member_name, member in inspect.getmembers(controller_module)
+                                     if inspect.isclass(member) and
+                                     issubclass(member, ControllerBase) and
+                                     member is not ControllerBase), None)
+
+            if not controller_class:
+                self.notify(f"Could not find controller class in module for {actual_controller_name_from_config}")
+                raise NotImplementedError
+
+            markets_to_initialize = {}
+            if hasattr(controller_config, 'update_markets') and callable(getattr(controller_config, 'update_markets')):
+                 markets_to_initialize = controller_config.update_markets({})
+
+            market_names_tuples = []
+            for conn_name, trading_pairs_set in markets_to_initialize.items():
+                market_names_tuples.append((conn_name, list(trading_pairs_set)))
+
+            self._initialize_markets(market_names_tuples)
+
+            if not hasattr(self, 'market_data_provider') or not isinstance(self.market_data_provider, MarketDataProvider):
+                 self.market_data_provider = MarketDataProvider(list(self.markets.values()), self.client_config_map)
+                 self.market_data_provider.start()
+
+            self.strategy = controller_class(
+                config=controller_config,
+                market_data_provider=self.market_data_provider,
+                strategy_name=actual_controller_name_from_config
+            )
+
+        else: # Legacy strategies
+            start_strategy_fn: Callable = get_strategy_starter_file(strategy_name)
+            if strategy_name in settings.STRATEGIES: # settings.STRATEGIES is for legacy strategies
+                start_strategy_fn(self) # This typically sets self.strategy
             else:
+                self.notify(f"Unknown strategy type: {strategy_name}. Start aborted.")
                 raise NotImplementedError
 
     async def confirm_oracle_conversion_rate(self,  # type: HummingbotApplication
