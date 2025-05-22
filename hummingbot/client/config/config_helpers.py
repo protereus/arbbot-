@@ -25,18 +25,29 @@ from hummingbot.client.config.config_data_types import BaseClientModel, ClientCo
 from hummingbot.client.config.config_var import ConfigVar
 from hummingbot.client.config.fee_overrides_config_map import fee_overrides_config_map, init_fee_overrides_config
 from hummingbot.client.config.gateway_ssl_config_map import SSLConfigMap
+from hummingbot.client import settings
 from hummingbot.client.settings import (
     CLIENT_CONFIG_PATH,
     CONF_DIR_PATH,
+    CONTROLLERS_MODULE,
     CONF_POSTFIX,
     CONF_PREFIX,
     CONNECTORS_CONF_DIR_PATH,
     GATEWAY_SSL_CONF_FILE,
     STRATEGIES_CONF_DIR_PATH,
+    CONTROLLERS_CONF_DIR_PATH,
     TEMPLATE_PATH,
     TRADE_FEES_CONFIG_PATH,
     AllConnectorSettings,
 )
+from hummingbot.strategy_v2.controllers.controller_base import ControllerConfigBase
+from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
+    DirectionalTradingControllerConfigBase,
+)
+from hummingbot.strategy_v2.controllers.market_making_controller_base import MarketMakingControllerConfigBase
+
+CONTROLLERS_CONF_DIR_PATH = CONF_DIR_PATH / "controllers"
+import importlib
 
 
 class ConfigValidationError(Exception):
@@ -628,17 +639,59 @@ def get_strategy_pydantic_config_cls(strategy_name: str):
 
 
 async def load_strategy_config_map_from_file(yml_path: Path) -> Union[ClientConfigAdapter, Dict[str, ConfigVar]]:
-    strategy_name = strategy_name_from_file(yml_path)
-    config_cls = get_strategy_pydantic_config_cls(strategy_name)
-    if config_cls is None:  # legacy
-        config_map = get_strategy_config_map(strategy_name)
-        template_path = get_strategy_template_path(strategy_name)
-        await load_yml_into_cm_legacy(str(yml_path), str(template_path), config_map)
-    else:
-        config_data = read_yml_file(yml_path)
-        hb_config = config_cls(**config_data)
+    config_data = read_yml_file(yml_path)
+    controller_name = config_data.get("controller_name")
+
+    if controller_name:
+        known_controller_subfolders = ["generic", "market_making", "directional_trading"]
+        controller_module = None
+        for subfolder in known_controller_subfolders:
+            try:
+                module_path_str = f"{CONTROLLERS_MODULE}.{subfolder}.{controller_name}"
+                controller_module = importlib.import_module(module_path_str)
+                break  # Found it
+            except ImportError:
+                continue
+
+        if not controller_module:
+            raise FileNotFoundError(
+                f"Controller module for '{controller_name}' not found in known subfolders: {known_controller_subfolders}."
+            )
+
+        config_class = next(
+            (
+                member
+                for member_name, member in inspect.getmembers(controller_module)
+                if inspect.isclass(member)
+                and issubclass(member, ControllerConfigBase)
+                and member not in [
+                    ControllerConfigBase,
+                    MarketMakingControllerConfigBase,
+                    DirectionalTradingControllerConfigBase,
+                ]
+            ),
+            None,
+        )
+
+        if not config_class:
+            raise TypeError(f"No suitable config class found in {controller_module}")
+
+        hb_config = config_class(**config_data)
         config_map = ClientConfigAdapter(hb_config)
-    return config_map
+        return config_map
+    else:  # Existing logic for strategies
+        strategy_name = strategy_name_from_file(yml_path)  # This will use the already read config_data
+        if not strategy_name: # If strategy field is also not found, then it's an invalid file.
+            raise ValueError(f"The configuration file {yml_path} is not a valid strategy or controller file.")
+        config_cls = get_strategy_pydantic_config_cls(strategy_name)
+        if config_cls is None:  # legacy
+            config_map = get_strategy_config_map(strategy_name)
+            template_path = get_strategy_template_path(strategy_name)
+            await load_yml_into_cm_legacy(str(yml_path), str(template_path), config_map)
+        else:
+            hb_config = config_cls(**config_data)
+            config_map = ClientConfigAdapter(hb_config)
+        return config_map
 
 
 def load_connector_config_map_from_file(yml_path: Path) -> ClientConfigAdapter:
@@ -652,11 +705,14 @@ def load_connector_config_map_from_file(yml_path: Path) -> ClientConfigAdapter:
 
 def load_client_config_map_from_file() -> ClientConfigAdapter:
     yml_path = CLIENT_CONFIG_PATH
+    is_fresh_install = not yml_path.exists()
     if yml_path.exists():
         config_data = read_yml_file(yml_path)
     else:
         config_data = {}
     client_config = ClientConfigMap(**config_data)
+    if is_fresh_install and client_config.previous_strategy is None:
+        client_config.previous_strategy = "arbitrage_controller_default.yml"
     config_map = ClientConfigAdapter(client_config)
     save_to_yml(yml_path, config_map)
     return config_map
@@ -857,8 +913,20 @@ async def create_yml_files_legacy():
     """
     Copy `hummingbot_logs.yml` and `conf_global.yml` templates to the `conf` directory on start up
     """
+    # Ensure the controllers directory exists
+    CONTROLLERS_CONF_DIR_PATH.mkdir(parents=True, exist_ok=True)
+
+    # Copy arbitrage_controller template
+    arbitrage_controller_template_fname = "conf_arbitrage_controller_TEMPLATE.yml"
+    arbitrage_controller_template_path = TEMPLATE_PATH / arbitrage_controller_template_fname
+    arbitrage_controller_dest_fname = "arbitrage_controller_default.yml"
+    arbitrage_controller_dest_path = CONTROLLERS_CONF_DIR_PATH / arbitrage_controller_dest_fname
+
+    if not arbitrage_controller_dest_path.is_file():
+        shutil.copy(str(arbitrage_controller_template_path), str(arbitrage_controller_dest_path))
+
     for fname in listdir(TEMPLATE_PATH):
-        if "_TEMPLATE" in fname and CONF_POSTFIX not in fname:
+        if "_TEMPLATE" in fname and CONF_POSTFIX not in fname and fname != arbitrage_controller_template_fname:
             stripped_fname = fname.replace("_TEMPLATE", "")
             template_path = str(TEMPLATE_PATH / fname)
             conf_path = join(CONF_DIR_PATH, stripped_fname)

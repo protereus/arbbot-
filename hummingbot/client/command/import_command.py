@@ -53,11 +53,34 @@ class ImportCommand:
             self.app.change_prompt(prompt=">>> ")
             raise
         self.strategy_file_name = file_name
-        self.strategy_name = (
-            config_map.strategy
-            if not isinstance(config_map, dict)
-            else config_map.get("strategy").value  # legacy
-        )
+        if isinstance(config_map, ClientConfigAdapter):
+            if hasattr(config_map.hb_config, 'strategy'):  # Legacy or script with Pydantic
+                self.strategy_name = config_map.strategy
+            elif hasattr(config_map.hb_config, 'controller_name'):  # V2 Controller
+                self.strategy_name = config_map.controller_name
+            else:
+                # Handle error or raise exception if neither is found
+                self.notify(f"Cannot determine strategy or controller name from {self.strategy_file_name}")
+                # self._in_start_check = False # Ensure start is aborted if this was part of start
+                # The above line is commented out as _in_start_check is not a standard attribute of ImportCommand or HummingbotApplication
+                self.strategy_file_name = None
+                # Reset prompt settings
+                self.placeholder_mode = False
+                self.app.hide_input = False
+                self.app.change_prompt(prompt=">>> ")
+                return  # Or raise an error
+        elif isinstance(config_map, dict):  # Legacy dict-based config_map
+            self.strategy_name = config_map.get("strategy").value
+        else:
+            # Handle unexpected config_map type
+            self.notify(f"Unknown configuration map type for {self.strategy_file_name}")
+            self.strategy_file_name = None
+            # Reset prompt settings
+            self.placeholder_mode = False
+            self.app.hide_input = False
+            self.app.change_prompt(prompt=">>> ")
+            return
+
         self.strategy_config_map = config_map
         self.notify(f"Configuration from {self.strategy_file_name} file is imported.")
         self.placeholder_mode = False
